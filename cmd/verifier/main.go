@@ -123,6 +123,14 @@ func main() {
 		verifiedBatches: make(map[string]bool),
 	}
 
+	// Catch-up: walk L1 for every historical postBatch involving our
+	// rollupId, replay the canonical derivation against our local anvil
+	// until L2 head root matches the on-chain commit. This is the
+	// "any node can sync from L1 alone" property — no settler trust.
+	if err := v.catchUp(ctx, common.Hash(rcfg.StateRoot)); err != nil {
+		log.Fatalf("catch-up failed: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", v.handle)
 	mux.HandleFunc("/status", v.statusHandler)
