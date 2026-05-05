@@ -225,13 +225,41 @@ log.
 | `nonce too low / replacement underpriced` from `forge create` | Chiado RPC mempool is lagging. Wait 30s and retry, or bump `--gas-price`. |
 | Settler can't reach your `:9100` | Firewall / NAT. Either open the port, set up a reverse tunnel (e.g. `ssh -R 9100:localhost:9100 settler-host`), or expose via Cloudflare Tunnel / Tailscale. |
 
-## Caveats / known limitations
+## Catch-up: how a fresh prover syncs from L1
 
-- **No catch-up.** The verifier expects to start with its L2 anvil at
-  block 0 and re-derive every batch from the beginning. Joining a
-  chain mid-flight isn't supported yet — you and the settler operator
-  need to coordinate so a fresh `rollupId` is created right before you
-  start.
+When the verifier starts and finds its L2 anvil head root ≠ the on-chain
+rollup root, it kicks off catch-up before serving any signBatch RPC.
+This is the canonical "any node can sync from L1 alone" property —
+zero settler trust:
+
+1. Filter L1 logs for `L2ExecutionPerformed(rollupId, newState)` from
+   the Rollups contract — one event per applied state delta. Public
+   Chiado RPC supports the standard log filter range, chunked at 5,000
+   blocks.
+2. Pre-flight all `TransactionDeposited` events from the deposit
+   gateway in one chunked sweep; index by L1 block. Per-batch deposit
+   lookups become O(1) map probes.
+3. For each unique L1 tx, fetch + ABI-decode the `postBatch(...)`
+   calldata, find our sub-batch's `callData`, and replay through the
+   derivation pipeline (decode → apply deposits → submit user txs →
+   mine).
+4. Loop: chain advances during replay, so re-poll on each pass until
+   our L2 root stabilises at the on-chain root.
+
+Public Chiado RPC rate-limits hard (~5-10 req/sec). Two defensive
+mechanisms are built in:
+
+- `withRetry` exponential backoff (500ms → 30s, 8 attempts) on the
+  recoverable HTTP errors (429, EOF, timeout, connection reset).
+- 80ms throttle between batches to stay under the limit proactively.
+
+Observed throughput on free-tier rate-limited RPC: ~8.5 batches/sec
+(~7 minutes for ~3,800 batches). Operators with their own RPC node
+will be faster.
+
+Progress is logged every 250 batches with rate + ETA.
+
+## Caveats / known limitations
 - **Chain id must match.** `L2_CHAIN_ID` here must equal what the
   settler runs (`4242` in the reference deployment). Otherwise the
   signed user txs decode to different recovered senders and you get
