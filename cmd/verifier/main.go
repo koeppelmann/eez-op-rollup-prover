@@ -173,6 +173,13 @@ type Verifier struct {
 	// successful commit).
 	preMineSnapshot string
 	preMineKey      string
+
+	// depositCache is populated once at the start of catchUp() with every
+	// L1 deposit emitted by our gateway in the relevant range, indexed by
+	// L1 block number. Per-batch lookups become a map probe instead of
+	// an L1 filter-logs roundtrip (which is critical against rate-limited
+	// public RPCs). Nil outside catch-up.
+	depositCache map[uint64][]l1.Deposit
 }
 
 type rollbackReq struct {

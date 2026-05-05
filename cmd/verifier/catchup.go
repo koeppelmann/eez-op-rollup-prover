@@ -115,6 +115,16 @@ func (v *Verifier) catchUp(ctx context.Context, onChainRoot common.Hash) error {
 	}
 	postBatchID := abiObj.Methods["postBatch"].ID
 
+	// Pre-flight: fetch ALL deposits to our gateway in one chunked sweep,
+	// index by L1 block, so per-batch FetchDeposits becomes a map lookup
+	// instead of an RPC roundtrip. Cuts replay traffic to public Chiado
+	// RPC roughly in half (most batches have zero deposits).
+	preDeposits, err := v.preloadDeposits(ctx)
+	if err != nil {
+		return fmt.Errorf("preload deposits: %w", err)
+	}
+	v.depositCache = preDeposits
+
 	rid := new(big.Int).SetUint64(v.cfg.RollupID)
 	ridTopic := common.BytesToHash(common.LeftPadBytes(rid.Bytes(), 32))
 
@@ -308,18 +318,15 @@ func (v *Verifier) replayHistoricalBatch(ctx context.Context, abiObj abi.ABI, po
 }
 
 // applyBatchCallData runs the canonical derivation against our local L2 anvil:
-// decode → fetch deposits → apply → submit user txs → mine.
+// decode → look up deposits in the precomputed cache → apply → submit user
+// txs → mine. The cache (`v.depositCache`) is populated once at the start
+// of catch-up so we don't roundtrip to L1 for every batch.
 func (v *Verifier) applyBatchCallData(ctx context.Context, callData []byte) error {
 	hdr, rawTxs, err := derivation.Decode(callData)
 	if err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
-	deps, err := withRetry(ctx, "FetchDeposits", func() ([]l1.Deposit, error) {
-		return derivation.FetchDeposits(ctx, v.l1, v.cfg.DepositGatewayAddr, hdr.L1FromBlock, hdr.L1ToBlock)
-	})
-	if err != nil {
-		return fmt.Errorf("fetch deposits: %w", err)
-	}
+	deps := v.depositsInRange(hdr.L1FromBlock, hdr.L1ToBlock)
 	if err := derivation.ApplyDeposits(ctx, v.l2, deps); err != nil {
 		return fmt.Errorf("apply deposits: %w", err)
 	}
@@ -343,6 +350,70 @@ func (v *Verifier) readOnChainStateRoot(ctx context.Context) (common.Hash, error
 		return common.Hash{}, err
 	}
 	return common.Hash(cfg.StateRoot), nil
+}
+
+// preloadDeposits fetches every L1 deposit emitted by our DepositGateway
+// in the range (StartL1Block-1, currentHead], chunked under the RPC's
+// log-range cap, indexed by L1 block. Each historical batch's
+// FetchDeposits call becomes a O(1) lookup against this map.
+//
+// Done once at the start of catch-up. Concurrent batches landing during
+// catch-up are picked up by pass 2 of the outer loop, which calls this
+// again.
+func (v *Verifier) preloadDeposits(ctx context.Context) (map[uint64][]l1.Deposit, error) {
+	from := v.cfg.StartL1Block
+	if from == 0 {
+		from = 1
+	}
+	head, err := v.l1.BlockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if head < from {
+		return map[uint64][]l1.Deposit{}, nil
+	}
+
+	out := map[uint64][]l1.Deposit{}
+	total := 0
+	for f := from; f <= head; f += logScanChunk {
+		t := f + logScanChunk - 1
+		if t > head {
+			t = head
+		}
+		// l1.RangeDepositEvents takes (from, to] semantics — it scans
+		// events in blocks (f, t]. Pass f-1 so the first iteration covers
+		// `from`.
+		deps, err := withRetry(ctx, "RangeDepositEvents", func() ([]l1.Deposit, error) {
+			return v.l1.RangeDepositEvents(ctx, v.cfg.DepositGatewayAddr, f-1, t)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("range deposits (%d, %d]: %w", f-1, t, err)
+		}
+		for _, d := range deps {
+			out[d.L1Block] = append(out[d.L1Block], d)
+			total++
+		}
+	}
+	log.Printf("catch-up: preloaded %d deposits in (%d, %d] (%d blocks indexed)",
+		total, from-1, head, len(out))
+	return out, nil
+}
+
+// depositsInRange returns deposits emitted in the L1 block range
+// (l1From, l1To] (matching the canonical derivation recipe). Order
+// preserved within each block — depends on the consistent insertion
+// order from preloadDeposits.
+func (v *Verifier) depositsInRange(l1From, l1To uint64) []l1.Deposit {
+	if v.depositCache == nil {
+		return nil
+	}
+	var out []l1.Deposit
+	for b := l1From + 1; b <= l1To; b++ {
+		if d, ok := v.depositCache[b]; ok {
+			out = append(out, d...)
+		}
+	}
+	return out
 }
 
 func bytesEq(a, b []byte) bool {
